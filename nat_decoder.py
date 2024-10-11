@@ -33,12 +33,13 @@ class PositionalEmbedding(nn.Module):
         else: 
             pos_emb = self.weight[positions]
             
+        print(f"positions: {positions.shape}") 
         pos_emb = pos_emb.to(input_ids.device)
         return pos_emb
 
 # Transformer Decoder
 class NATransformerDecoder(nn.Module):
-    def __init__(self, dictionary, cfg):
+    def __init__(self, dictionary, cfg, output_projection=None):
         super().__init__()
 
         self.embed_dim = cfg.decoder_embed_dim
@@ -75,19 +76,19 @@ class NATransformerDecoder(nn.Module):
         self.layers = nn.ModuleList(
             [self.build_decoder_layer(cfg, no_encoder_attn=False) for _ in range(cfg.decoder_layers)]
         )
-        
-        # Linear layers to project encoder output to target length and vocab size
-        self.encoder_to_tgt_len = nn.Linear(4800, self.max_target_length)  # Project 4800 to tgt_len
-        self.encoder_to_vocab_size = nn.Linear(self.embed_dim, self.vocab_size)  # Project to vocab_size
 
     def build_decoder_layer(self, cfg, no_encoder_attn=False):
         decoder_layer = TransformerDecoderLayerBase(
             num_heads=cfg.decoder_num_heads,
             embed_dim=cfg.decoder_embed_dim,
             ffn_embed_dim=cfg.decoder_ffn_embed_dim,
+            attention_heads=cfg.decoder_attention_heads,
             dropout=cfg.dropout,
             activation_fn=cfg.activation_fn,
             normalize_before=cfg.decoder_normalize_before,
+            no_encoder_attn=no_encoder_attn,
+            add_bias_kv=False,
+            add_zero_attn=False
         )
         return decoder_layer
 
@@ -106,45 +107,41 @@ class NATransformerDecoder(nn.Module):
 
     def extract_features(self, encoder_out):
         # Prepare decoder input IDs based on the target length
+        batch_size, _, _ = encoder_out['encoder_out'].shape
+        max_target_length = self.max_target_length # Assuming target length equals encoder sequence length
         device = encoder_out['encoder_out'].device
 
-        # Use ConvNet to extract image features
-        projected_to_tgt_len = self.encoder_to_tgt_len(encoder_out['encoder_out'].transpose(1, 2)).transpose(1, 2)
-
-        # Project the feature dimension from 1024 to vocab_size
-        projected_to_vocab_size = self.encoder_to_vocab_size(projected_to_tgt_len)
-
-        # Pick the maximum score over the vocab_size dimension to get the learnable input IDs
-        _, learnable_input_ids = projected_to_vocab_size.max(dim=-1)  # [batch_size, tgt_len]
-        learnable_input_ids = learnable_input_ids.to(device)
+        # Generate placeholder input IDs (e.g., use BOS token)
+        decoder_input_ids = torch.arange(max_target_length, device=device).unsqueeze(0).expand(batch_size, -1)
+        print(f"decoder_input_ids: {decoder_input_ids.shape}")
 
         # Embed tokens and get padding mask
-        x, _ = self.forward_embedding(learnable_input_ids)
-        
-        x = x.transpose(0, 1)  
-        # [batch_size, seq_len, embed_dim] => [seq_len, batch_size, embed_dim]
-        encoder_out = encoder_out["encoder_out"].transpose(0, 1)  
-        # [batch_size, seq_len_enc, embed_dim] => [seq_len_enc, batch_size, embed_dim]
-        
+        x, decoder_padding_mask = self.forward_embedding(decoder_input_ids)
+
         for layer in self.layers:
             x, attn = layer(  
                 x,
-                encoder_out
+                encoder_out=encoder_out["encoder_out"],
+                encoder_padding_mask=encoder_out.get("encoder_padding_mask", None),
+                self_attn_mask=None,
+                self_attn_padding_mask=decoder_padding_mask,
+                need_attn=False,
+                need_head_weights=False,
             )
-        # output of last layer => [seq_len, batch_size, embed_dim]
         # Final linear projection for output
         decoder_output = self.output_projection(x)
 
         return {
             "x": decoder_output,
             "attn": attn,
-            "learnable_query": learnable_input_ids,
+            "learnable_query": None,  # Update as per your implementation
             "linear_layer": self.output_projection.weight,
         }
 
     def forward(self, encoder_out):
         # Extract features from the decoder
         res = self.extract_features(encoder_out)
+
         # Return log softmax of the predicted sequence
         return {
             "real_res": F.log_softmax(res["x"], dim=-1),
@@ -155,13 +152,13 @@ class NATransformerDecoder(nn.Module):
     @staticmethod
     def base_architecture(args):
         # Set default architecture configurations
+
         args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 1024)
         args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 2048)
         args.decoder_layers = getattr(args, "decoder_layers", 6)
         args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 8)
         args.decoder_normalize_before = getattr(args, "decoder_normalize_before", False)
         args.decoder_learned_pos = getattr(args, "decoder_learned_pos", True)
-        args.decoder_num_heads = getattr(args, "decoder_num_heads", 8)
         args.attention_dropout = getattr(args, "attention_dropout", 0.1)
         args.activation_dropout = getattr(args, "activation_dropout", 0.1)
         args.activation_fn = getattr(args, "activation_fn", "relu")
@@ -169,6 +166,7 @@ class NATransformerDecoder(nn.Module):
         args.adaptive_softmax_cutoff = getattr(args, "adaptive_softmax_cutoff", None)
         args.adaptive_softmax_dropout = getattr(args, "adaptive_softmax_dropout", 0)
         args.share_decoder_input_output_embed = getattr(args, "share_decoder_input_output_embed", False)
-        args.max_target_length = getattr(args, "max_target_length", 100)
-        args.cross_self_attention = getattr(args, "cross_self_attention", True)
+        args.max_target_length = getattr(args, "max_target_length", 10)
+        args.decoder_num_heads = getattr(args, "decoder_num_heads", 64)
+        args.cross_self_attention = getattr(args, "cross_self_attention", False)
         args.no_scale_embedding = getattr(args, "no_scale_embedding", False)
